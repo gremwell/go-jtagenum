@@ -1,5 +1,9 @@
-// The original code is licensed under "license for this code is whatever you
+// The original code (JTAGEnum) is licensed under "license for this code is whatever you
 // want it to be" so we re-licensed it as GPLv3.
+// However, later this tool was significantly rewritten using ideas and pieces
+// of code from JTAGulator project (http://www.jtagulator.com) which is licensed
+// under "Creative Commons Attribution 3.0". We believe that we still comply
+// this license as we "attribute the work to the original author".
 
 package main
 
@@ -11,557 +15,878 @@ import (
 	"time"
 )
 
-// ===================================================
-// constants that can be modified by curious engineer:
-
-// Pattern used for scan() and loopback() tests
-// Use something random when trying find JTAG lines:
+// Pattern used for tests
+// Use something random when trying find JTAG lines
 const PATTERN = "0110011101001101101000010111001001"
 
-// Use something more determinate when trying to find
-// length of the DR register:
-//const PATTERN = "1000000000000000000000000000000000"
+// Maximum number of devices allowed in a single JTAG chain
+const MAX_DEV_NR = 32
 
-// Max. number of JTAG enabled chips (MAX_DEV_NR) and length
-// of the DR register together define the number of
-// iterations to run for scan_idcode():
-const MAX_DEV_NR = 8
-const IDCODE_LEN = 32
+// Minimum length of instruction register per IEEE Std. 1149.1
+const MIN_IR_LEN = 2
 
-// Target specific, check your documentation or guess 
-const SCAN_LEN = 1890 // used for IR enum. bigger the better
-const IR_LEN = 5
-// IR registers must be IR_LEN wide:
-const IR_IDCODE = "01100" // always 011
-const IR_SAMPLE = "10100" // always 101
-const IR_PRELOAD = IR_SAMPLE
+// Maximum length of instruction register
+const MAX_IR_LEN = 32
 
-// ===================================================
-// constants that should not be modified
+// Maximum total length of JTAG chain w/ IR selected
+const MAX_IR_CHAIN_LEN = MAX_DEV_NR * MAX_IR_LEN
 
-// TAP TMS states we care to use. NOTE: MSB sent first
-// Meaning ALL TAP and IR codes have their leftmost
-// bit sent first. This might be the reverse of what
-// documentation for your target(s) show.
-const TAP_RESET = "11111" // looping 1 will return
-// IDCODE if reg available
-const TAP_SHIFTDR = "111110100"
-const TAP_SHIFTIR = "1111101100" // -11111> Reset -0> Idle -1> SelectDR
-// -1> SelectIR -0> CaptureIR -0> ShiftIR
+// Maximum length of data register
+const MAX_DR_LEN = 1024
 
-// Ignore TCK, TMS use in loopback check:
-var IGNOREPIN = rpio.Pin(0xFF)
+const TAP_RESET = "111110"
+const TAP_SHIFTDR = "100"
+const TAP_SHIFTIR = "1100"
 
-// ===================================================
-// global variables controlled via command line arguments
-
-var DELAY_TAP = 50
-var DELAY_TOGGLE = 10
-var PULLUP = true
-var VERBOSE = false
-
-// ===================================================
-
-func delay(duration int) {
-	time.Sleep(time.Duration(duration) * time.Microsecond)
+type JtagPins struct {
+	TDI  rpio.Pin `json:"tdi"`
+	TDO  rpio.Pin `json:"tdo"`
+	TCK  rpio.Pin `json:"tck"`
+	TMS  rpio.Pin `json:"tms"`
+	TRST rpio.Pin `json:"trst"`
 }
 
-func pinWrite(pin rpio.Pin, state rpio.State) {
+type Jtag struct {
+	PinNames map[rpio.Pin]string
+
+	AllPins []rpio.Pin
+
+	KnownPins JtagPins
+
+	// pins which will be used by methods
+	// not putting them into struct just to save some space on typing
+	TDI  rpio.Pin
+	TDO  rpio.Pin
+	TCK  rpio.Pin
+	TMS  rpio.Pin
+	TRST rpio.Pin
+
+	IGNOREPIN rpio.Pin
+
+	DELAY_TCK   uint
+	DELAY_RESET uint
+	PULLUP      bool
+}
+
+// constructor to create Jtag instance with proper defaults
+func NewJtag() Jtag {
+	jtag := Jtag{}
+	jtag.IGNOREPIN = rpio.Pin(0xFF)
+	jtag.DELAY_TCK = 10
+	jtag.DELAY_RESET = 10 * 1000
+	jtag.PULLUP = false
+	return jtag
+}
+
+func delay(us uint) {
+	time.Sleep(time.Duration(us) * time.Microsecond)
+}
+
+func (J *Jtag) pinWrite(pin rpio.Pin, state rpio.State) {
 	pin.Write(state)
-	delay(DELAY_TOGGLE)
 }
 
-func pinRead(pin rpio.Pin) (rpio.State) {
-	delay(DELAY_TOGGLE)
+func (J *Jtag) pinWriteDelay(pin rpio.Pin, state rpio.State) {
+	pin.Write(state)
+	delay(J.DELAY_TCK)
+}
+
+func (J *Jtag) pinRead(pin rpio.Pin) rpio.State {
 	return pin.Read()
 }
 
-// Set the JTAG TAP state machine
-func tap_state(tap_state string, tck, tms rpio.Pin) {
-	for _, ts := range tap_state {
-		delay(DELAY_TAP)
-		pinWrite(tck, rpio.Low)
+func (J *Jtag) pulseTCK(cnt int) {
+	for i := 0; i < cnt; i += 1 {
+		J.pinWriteDelay(J.TCK, rpio.High)
+		J.pinWriteDelay(J.TCK, rpio.Low)
+	}
+}
+
+func (J *Jtag) pulseTMS(sTMS rpio.State) {
+	J.pinWrite(J.TMS, sTMS)
+	J.pulseTCK(1)
+}
+
+func (J *Jtag) setTapState(tapState string) {
+	for _, ts := range tapState {
 		if ts == '1' {
-			pinWrite(tms, rpio.High)
+			J.pinWrite(J.TMS, rpio.High)
 		} else {
-			pinWrite(tms, rpio.Low)
+			J.pinWrite(J.TMS, rpio.Low)
 		}
-		// rising edge shifts in TMS
-		pinWrite(tck, rpio.High)
+		J.pulseTCK(1)
 	}
 }
 
-func pulse_tms(tck, tms rpio.Pin, s_tms rpio.State) {
-	if tck == IGNOREPIN { return }
-	pinWrite(tck, rpio.Low)
-	pinWrite(tms, s_tms)
-	pinWrite(tck, rpio.High)
-}
-
-func pulse_tdi(tck, tdi rpio.Pin, s_tdi rpio.State) {
-	delay(DELAY_TAP)
-	if tck != IGNOREPIN {
-		pinWrite(tck, rpio.Low)
-	}
-	pinWrite(tdi, s_tdi)
-	if tck != IGNOREPIN {
-		pinWrite(tck, rpio.High)
-	}
-}
-
-func pulse_tdo(tck, tdo rpio.Pin) rpio.State {
-	delay(DELAY_TAP)
-	// read in TDO on falling edge
-	pinWrite(tck, rpio.Low)
-	tdo_read := pinRead(tdo)
-	pinWrite(tck, rpio.High)
-	return tdo_read
-}
-
-// Initialize all pins to a default state.
-// Default with no arguments: all pins as INPUTs
-func init_pins(pins []rpio.Pin, tck, tms, tdi, ntrst rpio.Pin) {
-	var allPins []rpio.Pin
-	if len(pins) == 0 {
-		allPins = []rpio.Pin{ tck, tms, tdi, ntrst }
+// initialize pins to a default state.
+func (J *Jtag) initPins() {
+	// we (probably) have all pins set in AllPins array
+	// however, some of them could be explicitly specified as J.TDI, J.TCK, etc
+	// thus, we must to initialize all pins to failsafe defaults and specific
+	// pins to the apropriate values according to their function
+	allPins := J.AllPins
+	if len(allPins) == 0 {
+		allPins = []rpio.Pin{J.TCK, J.TMS, J.TDI, J.TDO, J.TRST}
 	}
 
-	// default all to INPUT state
 	for _, pin := range allPins {
-		if pin == IGNOREPIN { continue }
-		pin.Input()
-		// internal pullups default to logic 1:
-		if PULLUP == true {
+		if pin == J.IGNOREPIN {
+			continue
+		}
+		pin.Output()
+		J.pinWrite(pin, rpio.High)
+		if J.PULLUP == true {
 			pin.PullUp()
-			pinWrite(pin, rpio.High)
 		} else {
 			pin.PullOff()
 		}
 	}
-	// TCK = output
-	if tck != IGNOREPIN { tck.Output() }
-	// TMS = output
-	if tms != IGNOREPIN { tms.Output() }
-	// tdi = output
-	if tdi != IGNOREPIN { tdi.Output() }
-	// ntrst = output, fixed to 1
-	if ntrst != IGNOREPIN {
-		ntrst.Output()
-		pinWrite(ntrst, rpio.High)
+
+	if J.TDO != J.IGNOREPIN {
+		J.TDO.Input()
+	}
+
+	// set known clock state
+	if J.TCK != J.IGNOREPIN {
+		J.pinWrite(J.TCK, rpio.Low)
 	}
 }
 
-/*
- * send pattern[] to TDI and check for output on TDO
- * This is used for both loopback, and Shift-IR testing, i.e.
- * the pattern may show up with some delay.
- * return: 0 = no match
- *         1 = match
- *         2 or greater = no pattern found but line appears active
- *
- * if retval == 1, *reglen returns the length of the register
- */
-func check_data(pattern string, iterations int, tck, tdi, tdo rpio.Pin, reg_len *int) int {
-	plen := len(pattern)
-	w := 0
-	// count how often tdo toggled
-	nr_toggle := 0
-
-	// we store the last plen (<=PATTERN_LEN) bits,
-	// rcv[0] contains the oldest bit
-	rcv := make([]byte, plen)
-
-	tdo_prev := byte('0')
-	if pinRead(tdo) == rpio.High {
-		tdo_prev = byte('1')
+func (J *Jtag) printPins() {
+	if J.TRST != J.IGNOREPIN {
+		fmt.Printf(" nTRST:%s", J.PinNames[J.TRST])
 	}
+	if J.TCK != J.IGNOREPIN {
+		fmt.Printf(" TCK:%s", J.PinNames[J.TCK])
+	}
+	if J.TMS != J.IGNOREPIN {
+		fmt.Printf(" TMS:%s", J.PinNames[J.TMS])
+	}
+	if J.TDO != J.IGNOREPIN {
+		fmt.Printf(" TDO:%s", J.PinNames[J.TDO])
+	}
+	if J.TDI != J.IGNOREPIN {
+		fmt.Printf(" TDI:%s", J.PinNames[J.TDI])
+	}
+}
 
-	for i := 0; i < iterations; i += 1 {
-		// output pattern and incr write index
-		tdi_val := rpio.Low
-		if pattern[w] == '1' {
-			tdi_val = rpio.High
-		}
-		w += 1
-		if w >= plen { w = 0 }
-		pulse_tdi(tck, tdi, tdi_val)
+// This method shifts data into the target's Data Register (DR).
+// The return value is the value read from the DR.
+// TAP must be in Run-Test-Idle state before being called.
+// Leaves the TAP in the Run-Test-Idle state.
+func (J *Jtag) sendData(pattern []byte) []byte {
+	J.setTapState(TAP_SHIFTDR)
 
-		// read from TDO and put it into rcv[]
-		tdo_read := byte('0')
-		if pinRead(tdo) == rpio.High {
-			tdo_read = byte('1')
-		}
-
-		if tdo_read != tdo_prev {
-			nr_toggle += 1
-		}
-		tdo_prev = tdo_read
-
-		if i < plen {
-			rcv[i] = tdo_read
+	ret := []byte{}
+	for i, s := range pattern {
+		if s == '1' {
+			J.pinWrite(J.TDI, rpio.High)
 		} else {
-			for k := 0; k < plen-1; k += 1 {
-				rcv[k] = rcv[k+1]
-			}
-			rcv[plen-1] = tdo_read
+			J.pinWrite(J.TDI, rpio.Low)
 		}
-
-		// check if we got the pattern in rcv[]
-		if i >= (plen - 1) {
-			if string(rcv) == pattern {
-				*reg_len = i + 1 - plen
-				return 1
-			}
+		if J.pinRead(J.TDO) == rpio.High {
+			ret = append(ret, '1')
+		} else {
+			ret = append(ret, '0')
 		}
+		if i == len(pattern)-1 {
+			// Go to Exit1
+			J.pinWrite(J.TMS, rpio.High)
+		}
+		J.pulseTCK(1)
 	}
 
-	*reg_len = 0
-	if nr_toggle > 1 {
-		return nr_toggle
-	}
+	// Go to Update DR, new data in effect
+	J.pulseTMS(rpio.High)
 
-	return 0
+	// Go to Run-Test-Idle
+	J.pulseTMS(rpio.Low)
+
+	return ret
 }
 
-func print_pins(pinnames map[rpio.Pin]string, tck, tms, tdo, tdi, ntrst rpio.Pin) {
-	if ntrst != IGNOREPIN {
-		fmt.Printf(" ntrst:%s", pinnames[ntrst])
+// This method loads the supplied instruction into the target's Instruction Register (IR).
+// The return value is the value read from the IR.
+// TAP must be in Run-Test-Idle state before being called.
+// Leaves the TAP in the Run-Test-Idle state.
+func (J *Jtag) sendInstruction(instruction []byte) []byte {
+	J.setTapState(TAP_SHIFTIR)
+
+	ret := []byte{}
+	for i, s := range instruction {
+		if s == '1' {
+			J.pinWrite(J.TDI, rpio.High)
+		} else {
+			J.pinWrite(J.TDI, rpio.Low)
+		}
+		if J.pinRead(J.TDO) == rpio.High {
+			ret = append(ret, '1')
+		} else {
+			ret = append(ret, '0')
+		}
+		if i == len(instruction)-1 {
+			// Go to Exit1
+			J.pinWrite(J.TMS, rpio.High)
+		}
+		J.pulseTCK(1)
 	}
-	fmt.Printf(" tck:%s", pinnames[tck])
-	fmt.Printf(" tms:%s", pinnames[tms])
-	fmt.Printf(" tdo:%s", pinnames[tdo])
-	if tdi != IGNOREPIN {
-		fmt.Printf(" tdi:%s", pinnames[tdi])
-	}
+
+	// Go to Update IR, new instruction in effect
+	J.pulseTMS(rpio.High)
+
+	// Go to Run-Test-Idle
+	J.pulseTMS(rpio.Low)
+
+	return ret
 }
 
-// Shift JTAG TAP to ShiftIR state.
-// Send pattern to TDI and check for output on TDO
- func scan(pins []rpio.Pin, pinnames map[rpio.Pin]string, pattern string) {
+// Run a Bypass through every device in the chain.
+// Leaves the TAP in the Run-Test-Idle state.
+// pattern -- value to shift into TDI
+// returns value received from TDO
+func (J *Jtag) sendRecvBypassPattern(devCnt int, pattern []byte) []byte {
+	J.setTapState(TAP_RESET)
+	J.setTapState(TAP_SHIFTIR)
+
+	// Force all devices in the chain (if they exist) into BYPASS mode using opcode of all 1s
+	J.pinWrite(J.TDI, rpio.High)
+	J.pulseTCK(devCnt * MAX_IR_LEN)
+
+	// Go to Exit1 IR
+	J.pulseTMS(rpio.High)
+
+	// Go to Update IR, new instruction in effect
+	J.pulseTMS(rpio.High)
+
+	// Go to Run-Test-Idle
+	J.pulseTMS(rpio.Low)
+
+	// append some bits to compensate the number of devices on bus
+	patternExt := pattern
+	for i := 0; i < devCnt; i += 1 {
+		patternExt = append(patternExt, '0')
+	}
+	return J.sendData(patternExt)
+}
+
+// Performs a blind interrogation to determine how many devices are connected in the JTAG chain.
+// In BYPASS mode, data shifted into TDI is received on TDO delayed by one clock cycle. We can
+// force all devices into BYPASS mode, shift known data into TDI, and count how many clock
+// cycles it takes for us to see it on TDO.
+// Leaves the TAP in the Run-Test-Idle state.
+func (J *Jtag) detectDevices() int {
+	J.setTapState(TAP_RESET)
+	J.setTapState(TAP_SHIFTIR)
+
+	// Force all devices in the chain (if they exist) into BYPASS mode using opcode of all 1s
+	J.pinWrite(J.TDI, rpio.High)
+	J.pulseTCK(MAX_IR_CHAIN_LEN - 1)
+
+	// Go to Exit1 IR
+	J.pulseTMS(rpio.High)
+
+	// Go to Update IR, new instruction in effect
+	J.pulseTMS(rpio.High)
+
+	// Go to Select DR Scan
+	J.pulseTMS(rpio.High)
+
+	// Go to Capture DR Scan
+	J.pulseTMS(rpio.Low)
+
+	// Go to Shift DR Scan
+	J.pulseTMS(rpio.Low)
+
+	// Send 1s to fill DRs of all devices in the chain (In BYPASS mode, DR length = 1 bit)
+	J.pulseTCK(MAX_DEV_NR)
+
+	// We are now in BYPASS mode with all DR set
+	// Send in a 0 on TDI and count until we see it on TDO
+	J.pinWrite(J.TDI, rpio.Low)
+	devCnt := 0
+	for devCnt = 0; devCnt < MAX_DEV_NR; devCnt += 1 {
+		if J.pinRead(J.TDO) == rpio.Low {
+			// If we have received our 0, it has propagated through the entire chain (one clock cycle per device in the chain)
+			break
+		}
+		J.pulseTCK(1)
+	}
+
+	if devCnt > MAX_DEV_NR-1 {
+		devCnt = 0
+	}
+
+	// Go to Exit1 DR
+	J.pulseTMS(rpio.High)
+
+	// Go to Update DR, new data in effect
+	J.pulseTMS(rpio.High)
+
+	// Go to Run-Test-Idle
+	J.pulseTMS(rpio.Low)
+
+	return devCnt
+}
+
+// Performs an interrogation to determine the instruction register length of the target device.
+// Limited in length to MAX_IR_LEN.
+// Assumes a single device in the JTAG chain.
+// Leaves the TAP in the Run-Test-Idle state.
+// Returns length of the instruction register
+func (J *Jtag) detectIrLength() uint32 {
+	// Reset TAP to Run-Test-Idle
+	J.setTapState(TAP_RESET)
+	// Go to Shift IR
+	J.setTapState(TAP_SHIFTIR)
+
+	// Flush the IR
+	J.pinWrite(J.TCK, rpio.Low)
+	// Since the length is unknown, send lots of 0s
+	J.pulseTCK(MAX_IR_LEN - 1)
+
+	// Once we are sure that the IR is filled with 0s
+	// Send in a 1 on TDI and count until we see it on TDO
+	J.pinWrite(J.TDI, rpio.High)
+	num := uint32(0)
+	for num = 0; num < MAX_IR_LEN; num += 1 {
+		// If we have received our 1, it has propagated through the entire instruction register
+		if J.pinRead(J.TDO) == rpio.High {
+			break
+		}
+		J.pulseTCK(1)
+	}
+
+	// If no 1 is received, then we are unable to determine IR length
+	if (num > MAX_IR_LEN-1) || (num < MIN_IR_LEN) {
+		num = 0
+	}
+
+	// Go to Exit1 DR
+	J.pulseTMS(rpio.High)
+
+	// Go to Update DR, new data in effect
+	J.pulseTMS(rpio.High)
+
+	// Go to Run-Test-Idle
+	J.pulseTMS(rpio.Low)
+
+	return num
+}
+
+// Performs an interrogation to determine the data register length of the target device.
+// The selected data register will vary depending on the the instruction.
+// Limited in length to MAX_DR_LEN.
+// Assumes a single device in the JTAG chain.
+// Leaves the TAP in the Run-Test-Idle state.
+// opcode -- opcode/instruction to be sent to TAP
+// returns length of the data register
+func (J *Jtag) detectDrLength(opcode uint32) uint32 {
+	// Determine length of TAP IR
+	len := J.detectIrLength()
+	// Send instruction/opcode (only len bits)
+	opcodeStr := []byte{}
+	for i := uint32(0); i < len; i += 1 {
+		if (opcode | (1 << i)) != 0 {
+			opcodeStr = append(opcodeStr, '1')
+		} else {
+			opcodeStr = append(opcodeStr, '0')
+		}
+	}
+	J.sendInstruction(opcodeStr)
+	// Go to Shift IR
+	J.setTapState(TAP_SHIFTIR)
+
+	// At this point, a specific DR will be selected, so we can now determine its length.
+	// Flush the DR
+	J.pinWrite(J.TDI, rpio.Low)
+	J.pulseTCK(MAX_DR_LEN - 1)
+
+	// Once we are sure that the DR is filled with 0s
+	// Send in a 1 on TDI and count until we see it on TDO
+	J.pinWrite(J.TDI, rpio.High)
+	num := uint32(0)
+	for num = 0; num < MAX_DR_LEN; num += 1 {
+		// If we have received our 1, it has propagated through the entire data register
+		if J.pinRead(J.TDO) == rpio.High {
+			break
+		}
+		J.pulseTCK(1)
+	}
+
+	// If no 1 is received, then we are unable to determine DR length
+	if num > MAX_IR_LEN-1 {
+		num = 0
+	}
+
+	// Go to Exit1 DR
+	J.pulseTMS(rpio.High)
+
+	// Go to Update DR, new data in effect
+	J.pulseTMS(rpio.High)
+
+	// Go to Run-Test-Idle
+	J.pulseTMS(rpio.Low)
+
+	return num
+}
+
+func (J *Jtag) scanBypass(pattern string) {
 	fmt.Println("================================")
 	fmt.Printf("Starting scan for pattern %s\n", pattern)
+	defer fmt.Println("================================")
 
-	for _, ntrst := range pins {
-		for _, tck := range pins {
-			if tck == ntrst { continue }
-			for _, tms := range pins {
-				if tms == ntrst { continue }
-				if tms == tck { continue }
-				for _, tdo := range pins {
-					if tdo == ntrst { continue }
-					if tdo == tck { continue }
-					if tdo == tms { continue }
-					for _, tdi := range pins {
-						if tdi == ntrst { continue }
-						if tdi == tck { continue }
-						if tdi == tms { continue }
-						if tdi == tdo { continue }
-						if VERBOSE == true {
-							print_pins(pinnames, tck, tms, tdo, tdi, ntrst)
-							fmt.Print("    ")
+	for _, tck := range J.AllPins {
+		for _, tms := range J.AllPins {
+			if tms == tck {
+				continue
+			}
+			for _, tdo := range J.AllPins {
+				if tdo == tck || tdo == tms {
+					continue
+				}
+				for _, tdi := range J.AllPins {
+					if tdi == tck || tdi == tms || tdi == tdo {
+						continue
+					}
+
+					J.TDI = tdi
+					J.TDO = tdo
+					J.TMS = tms
+					J.TCK = tck
+					J.TRST = J.IGNOREPIN
+
+					J.initPins()
+
+					devCnt := J.detectDevices()
+					if devCnt == 0 || devCnt > MAX_DEV_NR {
+						continue
+					}
+
+					bitsRecv := J.sendRecvBypassPattern(devCnt, []byte(pattern))
+					// we need only last len(pattern) bits
+					patternRecv := string(bitsRecv[devCnt:])
+
+					if patternRecv == pattern {
+						fmt.Print("FOUND! ")
+						J.printPins()
+
+						fmt.Print(", possible nTRST: ")
+
+						// Now try to determine if the TRST# pin is being used on the target
+						for _, trst := range J.AllPins {
+							if trst == tdi || trst == tdo || trst == tms || trst == tck {
+								continue
+							}
+
+							J.TRST = trst
+
+							// do reset
+							J.pinWrite(J.TRST, rpio.Low)
+							// Give target time to react
+							delay(J.DELAY_RESET)
+
+							devCntNew := J.detectDevices()
+							// If the new value doesn't match what we already have, then the current pin may be a reset line.
+							if devCntNew != devCnt {
+								fmt.Printf("%s ", J.PinNames[J.TRST])
+							}
+
+							// Bring the current pin HIGH when done
+							J.pinWrite(J.TRST, rpio.High)
 						}
-						init_pins(pins, tck, tms, tdi, ntrst)
-						tap_state(TAP_SHIFTIR, tck, tms)
-						reg_len := 0
-						checkdataret := check_data(pattern, 2*len(pattern),	tck, tdi, tdo, &reg_len)
-						if checkdataret == 1 {
-							fmt.Print("FOUND! ")
-							print_pins(pinnames, tck, tms, tdo, tdi, ntrst)
-							fmt.Printf(" IR length: %d\n", reg_len)
-						} else if checkdataret > 1 {
-							fmt.Print("active ")
-							print_pins(pinnames, tck, tms, tdo, tdi, ntrst)
-							fmt.Printf(" bits toggled:%d\n", checkdataret)
-						} else if VERBOSE {
-							fmt.Println("")
-						}
+						fmt.Println("")
+					} else {
+						fmt.Print("active, ")
+						J.printPins()
+						fmt.Printf(", wrong data received (%s)\n", patternRecv)
+						fmt.Println("       try adjusting frequency, delays, pullup, check hardware connectivity")
 					}
 				}
 			}
 		}
 	}
-	fmt.Println("================================")
 }
 
-/*
- * Check for pins that pass pattern[] between tdi and tdo
- * regardless of JTAG TAP state (tms, tck ignored).
- *
- * TDO, TDI pairs that match indicate possible shorts between
- * pins. Pins that do not match but are active might indicate
- * that the patch cable used is not shielded well enough. Run
- * the test again without the cable connected between controller
- * and target. Run with the verbose flag to examine closely.
- */
-func loopback_check(pins []rpio.Pin, pinnames map[rpio.Pin]string, pattern string) {
+func (J *Jtag) testBypass(pattern string) {
 	fmt.Println("================================")
-	fmt.Println("Starting loopback check...")
+	fmt.Printf("Starting BYPASS test for pattern %s\n", pattern)
+	defer fmt.Println("================================")
 
-	for _, tdo := range pins {
-		for _, tdi := range pins {
-			if tdi == tdo { continue }
-			if VERBOSE == true {
-				fmt.Printf(" tdo:%s", pinnames[tdo])
-				fmt.Printf(" tdi:%s", pinnames[tdi])
-				fmt.Print("    ")
+	J.TCK = J.KnownPins.TCK
+	J.TDO = J.KnownPins.TDO
+	J.TDI = J.KnownPins.TDI
+	J.TMS = J.KnownPins.TMS
+	J.TRST = J.KnownPins.TRST
+
+	J.initPins()
+
+	devCnt := J.detectDevices()
+	if devCnt == 0 || devCnt >= MAX_DEV_NR-1 {
+		fmt.Println("no devices found")
+		return
+	}
+
+	bitsRecv := J.sendRecvBypassPattern(devCnt, []byte(pattern))
+	// we need only last len(pattern) bits
+	patternRecv := string(bitsRecv[devCnt:])
+
+	fmt.Printf("sent pattern: %s\n", pattern)
+	fmt.Printf("recv pattern: %s\n", patternRecv)
+
+	if patternRecv == pattern {
+		fmt.Println("match!")
+	} else {
+		fmt.Println("no match")
+	}
+}
+
+// Retrieves the JTAG device ID from each device in the chain.
+// Leaves the TAP in the Run-Test-Idle state.
+// The Device Identification register (if it exists) should be immediately available
+// in the DR after power-up of the target device or after TAP reset.
+// argument -- number of devices in JTAG chain
+// returns array of idcodes obtained (they still need verification)
+func (J *Jtag) getIdcodes(devCnt int) []uint32 {
+	// Reset TAP to Run-Test-Idle
+	J.setTapState(TAP_RESET)
+	// Go to Shift DR
+	J.setTapState(TAP_SHIFTDR)
+
+	idcodes := []uint32{}
+
+	// For each device in the chain...
+	for i := 0; i < devCnt; i += 1 {
+		// Receive 32-bit value from DR (should be IDCODE if exists), leaves the TAP in Exit1 DR
+		idcode := uint32(0)
+		for k := 0; k < 32; k += 1 {
+			if J.pinRead(J.TDO) == rpio.High {
+				idcode |= (1 << uint(k))
 			}
-			init_pins(pins, IGNOREPIN, IGNOREPIN, tdi, IGNOREPIN)
-			reg_len := 0
-			checkdataret := check_data(pattern, 2*len(pattern), IGNOREPIN, tdi, tdo, &reg_len)
-			if checkdataret == 1 {
-				fmt.Print("FOUND! ")
-				fmt.Printf(" tdo:%s", pinnames[tdo])
-				fmt.Printf(" tdi:%s", pinnames[tdi])
-				fmt.Printf(" reglen:%d\n", reg_len)
-			} else if checkdataret > 1 {
-				fmt.Print("active ")
-				fmt.Printf(" tdo:%s", pinnames[tdo])
-				fmt.Printf(" tdi:%s", pinnames[tdi])
-				fmt.Printf(" bits toggled:%d\n", checkdataret)
-			} else if VERBOSE == true {
-				fmt.Println("")
+			if k == 31 {
+				// Go to Exit1
+				J.pinWrite(J.TMS, rpio.High)
 			}
+			J.pulseTCK(1)
 		}
+
+		idcodes = append(idcodes, idcode)
+
+		// Go to Pause DR
+		J.pulseTMS(rpio.Low)
+
+		// Go to Exit2 DR
+		J.pulseTMS(rpio.High)
+
+		// Go to Shift DR
+		J.pulseTMS(rpio.Low)
 	}
-	fmt.Println("================================")
+
+	// Reset TAP to Run-Test-Idle
+	J.setTapState(TAP_RESET)
+
+	return idcodes
 }
 
-func list_pin_names(pins []rpio.Pin, pinnames map[rpio.Pin]string) {
-	fmt.Println("The configured pins are:")
-	for _, pin := range pins {
-		fmt.Print(pinnames[pin], " ")
-	}
-	fmt.Println("")
-}
-
-/*
- * Scan TDO for IDCODE. Handle MAX_DEV_NR many devices.
- * We feed zeros into TDI and wait for the first 32 of them to come out at TDO (after n * 32 bit).
- * As IEEE 1149.1 requires bit 0 of an IDCODE to be a "1", we check this bit.
- * We record the first bit from the idcodes into bit0.
- * (oppposite to the old code).
- * If we get an IDCODE of all ones, we assume that the pins are wrong.
- * This scan assumes IDCODE is the default DR between TDI and TDO.
- */
-func scan_idcode(pins []rpio.Pin, pinnames map[rpio.Pin]string) {
+func (J *Jtag) scanIdcode() {
 	fmt.Println("================================")
 	fmt.Println("Starting scan for IDCODE...")
-	fmt.Println("(assumes IDCODE default DR)")
+	defer fmt.Println("================================")
 
-	idcodes := make([]uint32, MAX_DEV_NR)
+	for _, tck := range J.AllPins {
+		for _, tms := range J.AllPins {
+			if tms == tck {
+				continue
+			}
+			for _, tdo := range J.AllPins {
+				if tdo == tck || tdo == tms {
+					continue
+				}
 
-	for _, ntrst := range pins {
-		for _, tck := range pins {
-			if tck == ntrst { continue }
-			for _, tms := range pins {
-				if tms == ntrst { continue }
-				if tms == tck {	continue }
-				for _, tdo := range pins {
-					if tdo == ntrst { continue }
-					if tdo == tck { continue }
-					if tdo == tms {	continue }
-					for _, tdi := range pins {
-						if tdi == ntrst { continue }
-						if tdi == tck { continue }
-						if tdi == tms {	continue }
-						if tdi == tdo { continue }
-						if VERBOSE == true {
-							print_pins(pinnames, tck, tms, tdo, tdi, ntrst)
-							fmt.Print("    ")
-						}
-						init_pins(pins, tck, tms, tdi, ntrst)
+				J.TCK = tck
+				J.TMS = tms
+				J.TDO = tdo
+				J.TDI = J.IGNOREPIN
+				J.TRST = J.IGNOREPIN
 
-						// we hope that IDCODE is the default DR after reset
-						tap_state(TAP_RESET, tck, tms)
-						tap_state(TAP_SHIFTDR, tck, tms)
+				J.initPins()
 
-						// j is the number of bits we pulse into TDI and read from TDO
-						i := uint(0)
-						for i = 0; i < MAX_DEV_NR; i += 1 {
-							idcodes[i] = 0
-							for j := uint(0); j < IDCODE_LEN; j += 1 {
-								// we send '0' in
-								pulse_tdi(tck, tdi, rpio.Low)
-								tdo_read := pinRead(tdo)
-								if tdo_read == rpio.High {
-									idcodes[i] |= (uint32(1)) << j
-								}
+				// Try to get the 1st Device ID in the chain (if it exists) by reading the DR
+				idcodes := J.getIdcodes(1)
 
-								if VERBOSE == true {
-									fmt.Print(tdo_read)
-								}
-							}
+				// Ignore if received Device ID is 0xFFFFFFFF or if bit 0 != 1
+				if idcodes[0] != 0xFFFFFFFF && (idcodes[0]%2) != 0 {
+					fmt.Print("FOUND! ")
+					J.printPins()
+					fmt.Println("")
 
-							if VERBOSE == true {
-								fmt.Print(" ")
-								fmt.Println(idcodes[i])
-							}
+					// Since we might not know how many devices are in the chain, try the maximum allowable number and verify the results afterwards
+					idcodes = J.getIdcodes(MAX_DEV_NR)
 
-							/* save time: break at the first idcode with bit0 != 1 */
-							if ((idcodes[i] & 1) == 0) || (idcodes[i] == 0xffffffff) {
-								break
-							}
-						}
-						if i > 0 {
-							print_pins(pinnames, tck, tms, tdo, tdi, ntrst)
-							fmt.Printf("  devices: %d\n", i)
-							for j := uint(0); j < i; j += 1 {
-								fmt.Printf("  0x%x\n", idcodes[j])
-							}
+					fmt.Println("     devices:")
+					for _, idcode := range idcodes {
+						if idcode != 0xFFFFFFFF && (idcode%2) != 0 {
+							fmt.Printf("        %s\n", describeIdcode(idcode))
 						}
 					}
-				}
-			}
-		}
-	}
-	fmt.Println("================================")
-}
 
-func shift_bypass(pins []rpio.Pin, pinnames map[rpio.Pin]string) {
-	fmt.Println("================================")
-	fmt.Println("Starting shift of pattern through bypass...")
-	fmt.Println("Assumes bypass is the default DR on reset.")
-	fmt.Println("Hence, no need to check for TMS. Also, currently")
-	fmt.Println("not checking for nTRST, which might not work")
+					fmt.Print("     possible nTRST: ")
 
-	for _, tck := range pins {
-		for _, tdi := range pins {
-			if tdi == tck {	continue }
-			for _, tdo := range pins {
-				if tdo == tck {	continue }
-				if tdo == tdi {	continue }
-				if VERBOSE == true {
-					fmt.Printf(" tck:%s", pinnames[tck])
-					fmt.Printf(" tdi:%s", pinnames[tdi])
-					fmt.Printf(" tdo:%s", pinnames[tdo])
-					fmt.Print("     ")
-				}
+					// Now try to determine if the TRST# pin is being used on the target
+					for _, trst := range J.AllPins {
+						if trst == tck || trst == tms || trst == tdo {
+							continue
+						}
 
-				init_pins(pins, tck, IGNOREPIN, tdi, IGNOREPIN)
-				// if bypass is default on start, no need to init TAP state
-				reg_len := 0
-				checkdataret := check_data(PATTERN, 2*len(PATTERN), tck, tdi, tdo, &reg_len)
-				if checkdataret == 1 {
-					fmt.Print("FOUND! ")
-					fmt.Printf(" tck:%s", pinnames[tck])
-					fmt.Printf(" tdo:%s", pinnames[tdo])
-					fmt.Printf(" tdi:%s", pinnames[tdi])
-				} else if checkdataret > 1 {
-					fmt.Print("active ")
-					fmt.Printf(" tck:%s", pinnames[tck])
-					fmt.Printf(" tdo:%s", pinnames[tdo])
-					fmt.Printf(" tdi:%s", pinnames[tdi])
-					fmt.Printf("  bits toggled:%d\n", checkdataret)
-				} else if VERBOSE == true {
+						J.TRST = trst
+
+						// do reset
+						J.pinWrite(J.TRST, rpio.Low)
+						// Give target time to react
+						delay(J.DELAY_RESET)
+
+						// Try to get Device ID again by reading the DR (1st in the chain)
+						idcodesNew := J.getIdcodes(1)
+						// If the new value doesn't match what we already have, then the current pin may be a reset line.
+						if len(idcodesNew) != len(idcodes) || (idcodesNew[0] != idcodes[0]) {
+							fmt.Printf("%s ", J.PinNames[J.TRST])
+						}
+
+						// Bring the current pin HIGH when done
+						J.pinWrite(J.TRST, rpio.High)
+					}
 					fmt.Println("")
 				}
 			}
 		}
 	}
-	fmt.Println("================================")
 }
 
-/* ir_state()
- * Set TAP to Reset then ShiftIR. 
- * Shift in state[] as IR value.
- * Switch to ShiftDR state and end.
- */
-func ir_state(state string, tck, tms, tdi rpio.Pin) {
-	tap_state(TAP_SHIFTIR, tck, tms)
-	for i := 0; i < IR_LEN; i += 1 {
-		delay(DELAY_TAP)
-		// TAP/TMS changes to Exit IR state (1) must be executed
-		// at same time that the last TDI bit is sent:
-		if i == IR_LEN - 1 {
-			pinWrite(tms, rpio.High) // ExitIR
+// Check for pins that pass pattern[] between tdi and tdo
+// regardless of JTAG TAP state (tms, tck ignored).
+// TDO, TDI pairs that match indicate possible shorts between
+// pins. Pins that do not match but are active might indicate
+// that the patch cable used is not shielded well enough. Run
+// the test again without the cable connected between controller
+// and target. Run with the verbose flag to examine closely.
+func (J *Jtag) checkLoopback(pattern string) {
+	fmt.Println("================================")
+	fmt.Println("Starting loopback check...")
+	defer fmt.Println("================================")
+
+	for _, tdo := range J.AllPins {
+		for _, tdi := range J.AllPins {
+			if tdi == tdo {
+				continue
+			}
+
+			J.TDI = tdi
+			J.TDO = tdo
+			J.TRST = J.IGNOREPIN
+			J.TCK = J.IGNOREPIN
+			J.TMS = J.IGNOREPIN
+
+			J.initPins()
+
+			recv := []byte{}
+			for _, s := range pattern {
+				if s == '1' {
+					J.pinWrite(J.TDI, rpio.High)
+				} else {
+					J.pinWrite(J.TDI, rpio.Low)
+				}
+				if J.pinRead(J.TDO) == rpio.High {
+					recv = append(recv, '1')
+				} else {
+					recv = append(recv, '0')
+				}
+			}
+
+			if string(recv) == pattern {
+				fmt.Printf("possible short detected between %s and %s\n", J.PinNames[J.TDO], J.PinNames[J.TDI])
+			} else {
+				for i := 1; i < len(recv); i += 1 {
+					if recv[i] != recv[0] {
+						fmt.Printf("possible interconnection (check cable) detected between %s and %s\n", J.PinNames[J.TDO], J.PinNames[J.TDI])
+						return
+					}
+				}
+			}
 		}
-		tdi_val := rpio.Low
-		if state[i] == '1' {
-			tdi_val = rpio.High
-		}
-		pulse_tdi(tck, tdi, tdi_val)
-		// TMS already set to 0 "shiftir" state to shift in bit to IR
 	}
-	// a reset would cause IDCODE instruction to be selected again
-	tap_state("1100", tck, tms) // -1> UpdateIR -1> SelectDR -0> CaptureDR -0> ShiftDR
 }
 
-func sample(pins []rpio.Pin, iterations int, tck, tms, tdi, tdo, ntrst rpio.Pin) {
+func (J *Jtag) testIdcode() {
 	fmt.Println("================================")
-	fmt.Println("Starting sample (boundary scan)...")
+	fmt.Println("Attempting to retreive IDCODE...")
+	defer fmt.Println("================================")
 
-	init_pins(pins, tck, tms, tdi, ntrst)
+	J.TDI = J.KnownPins.TDI
+	J.TDO = J.KnownPins.TDO
+	J.TCK = J.KnownPins.TCK
+	J.TMS = J.KnownPins.TMS
+	J.TRST = J.KnownPins.TRST
+
+	J.initPins()
+
+	// Since we might not know how many devices are in the chain, try the maximum allowable number and verify the results afterwards
+	idcodes := J.getIdcodes(MAX_DEV_NR)
+
+	fmt.Println("devices:")
+
+	// For each device in the chain...
+	for _, idcode := range idcodes {
+		// Ignore if received Device ID is 0xFFFFFFFF or if bit 0 != 1
+		if idcode != 0xFFFFFFFF && (idcode%2) != 0 {
+			fmt.Println(describeIdcode(idcode))
+		}
+	}
+}
+
+func (J *Jtag) discoverOpcode() {
+	fmt.Println("================================")
+	fmt.Println("Attempting to retreive IDCODE...")
+	defer fmt.Println("================================")
+
+	J.TDI = J.KnownPins.TDI
+	J.TDO = J.KnownPins.TDO
+	J.TCK = J.KnownPins.TCK
+	J.TMS = J.KnownPins.TMS
+	J.TRST = J.KnownPins.TRST
+
+	J.initPins()
+
+	// Get number of devices in the chain
+	devCnt := J.detectDevices()
+	if devCnt == 0 {
+		fmt.Println("no devices in chain")
+		return
+	} else if devCnt > 1 {
+		fmt.Println("more than one device in chain")
+		return
+	}
+
+	irlen := J.detectIrLength()
+	fmt.Print("IR length: ")
+	if irlen == 0 {
+		fmt.Println("N/A")
+		return
+	} else {
+		fmt.Println(irlen)
+	}
+
+	opcodeMax := uint32((1 << irlen) - 1)
+	fmt.Printf("Possible instructions: %d\n", opcodeMax)
+
+	// For every possible instruction...
+	for opcode := uint32(0); opcode < opcodeMax; opcode += 1 {
+		// Get the DR length
+		drlen := J.detectDrLength(opcode)
+		// ignore 1-bit instructions
+		if drlen > 1 {
+			// Display the result
+			fmt.Printf("%s\n", describeIrDr(irlen, opcode, drlen))
+		}
+	}
+
+	// Reset TAP to Run-Test-Idle
+	J.setTapState(TAP_RESET)
+}
+
+func (J *Jtag) boundaryScan() {
+	fmt.Println("================================")
+	fmt.Println("Starting boundary scan...")
+	defer fmt.Println("================================")
+
+	J.TDI = J.KnownPins.TDI
+	J.TDO = J.KnownPins.TDO
+	J.TCK = J.KnownPins.TCK
+	J.TMS = J.KnownPins.TMS
+	J.TRST = J.KnownPins.TRST
+
+	J.initPins()
+
+	// Get number of devices in the chain
+	devCnt := J.detectDevices()
+	if devCnt == 0 {
+		fmt.Println("no devices in chain")
+		return
+	} else if devCnt > 1 {
+		fmt.Println("more than one device in chain, not supported")
+		return
+	}
+
+	// Determine length of TAP IR
+	irLen := J.detectIrLength()
+	// IR registers must be IR_LEN wide:
+	irSample := []byte{'1', '0', '1'}
+	if irLen > uint32(len(irSample)) {
+		for i := uint32(0); i < irLen-3; i += 1 {
+			irSample = append(irSample, '0')
+		}
+	}
 
 	// send instruction and go to ShiftDR
-	ir_state(IR_SAMPLE, tck, tms, tdi)
+	J.sendInstruction(irSample)
 
 	// Tell TAP to go to shiftout of selected data register (DR)
-	// is determined by the instruction we sent, in our case 
+	// is determined by the instruction we sent, in our case
 	// SAMPLE/boundary scan
-	for i := 0; i < iterations; i += 1 {
-		// no need to set TMS. It's set to the '0' state to 
+	for i := 0; i < 2000; i += 1 {
+		// no need to set TMS. It's set to the '0' state to
 		// force a Shift DR by the TAP
-		fmt.Print(pulse_tdo(tck, tdo))
-		if i % 32 == 31 { fmt.Print(" ") }
-		if i % 128 == 127 {	fmt.Println("")	}
+		if J.pinRead(J.TDO) == rpio.High {
+			fmt.Print('1')
+		} else {
+			fmt.Print('0')
+		}
+		J.pulseTCK(1)
+		if i%32 == 31 {
+			fmt.Print(" ")
+		}
+		if i%128 == 127 {
+			fmt.Println("")
+		}
 	}
 	fmt.Println("")
+
+	// Reset TAP to Run-Test-Idle
+	J.setTapState(TAP_RESET)
 }
 
-func brute_ir(pins []rpio.Pin, iterations int, tck, tms, tdi, tdo, ntrst rpio.Pin) {
-	fmt.Println("================================")
-	fmt.Println("Starting brute force scan of IR instructions...")
-	fmt.Println("NOTE: If Verbose mode is off output is only printed")
-	fmt.Println("      after activity (bit changes) are noticed and")
-	fmt.Println("      you might not see the first bit of output.")
-	fmt.Printf("IR_LEN set to %d\n", IR_LEN)
+func describeIdcode(idcode uint32) string {
+	mfg := (idcode & 0xffe) >> 1
+	part := (idcode & 0xffff000) >> 12
+	ver := (idcode & 0xf0000000) >> 28
+	bank := (idcode & 0xf00) >> 8
+	id := (idcode & 0xfe) >> 1
+	mfgName := Jep106Manufacturer(bank, id)
 
-	init_pins(pins, tck, tms, tdi, ntrst)
+	return fmt.Sprintf("0x%08x (mfg: 0x%3.3x (%s), part: 0x%4.4x, ver: 0x%1.1x)",
+		idcode, mfg, mfgName, part, ver)
+}
 
-	for ir := uint32(0); ir < (1 << IR_LEN); ir += 1 {
-		ir_buf := make([]byte, 0)
-		// send instruction and go to ShiftDR (ir_state() does this already)
-		// convert ir to string.
-		for i := uint(0); i < IR_LEN; i += 1 {
-			ir_buf = append(ir_buf, byte('0'))
-			if ir & (1 << i) > 0 {
-				ir_buf[i] = '1'
-			}
-		}
-		ir_state(string(ir_buf[:]), tck, tms, tdi)
-		// we are now in TAP_SHIFTDR state
+func describeIrDr(irlen, opcode, drlen uint32) string {
+	ret := ""
+	// Display current instruction
+	ret += "IR: "
 
-		iractive := 0
-
-		prevread := pulse_tdo(tck, tdo)
-		for i := 0; i > iterations-1; i += 1 {
-			// no need to set TMS. It's set to the '0' state to force a Shift DR by the TAP
-			tdo_read := pulse_tdo(tck, tdo)
-			if tdo_read != prevread {
-				iractive += 1
-			}
-
-			if iractive > 0 || VERBOSE == true {
-				fmt.Print(prevread)
-				if i % 16 == 15 { fmt.Print(" ") }
-				if i % 128 == 127 {	fmt.Println("")	}
-			}
-
-			prevread = tdo_read
-		}
-
-		if iractive > 0 || VERBOSE == true {
-			fmt.Printf("%d  Ir %s bits changed %d\n", prevread, string(ir_buf), iractive)
+	// ...as binary characters (0/1)
+	for i := uint32(0); i < irlen; i += 1 {
+		if (opcode & (1 << i)) == 0 {
+			ret += "0 "
+		} else {
+			ret += "1 "
 		}
 	}
-}
 
-type JtagPins struct {
-	Tdi rpio.Pin `json:"tdi"`
-	Tdo rpio.Pin `json:"tdo"`
-	Tms rpio.Pin `json:"tms"`
-	Tck rpio.Pin `json:"tck"`
-	Ntrst rpio.Pin `json:"ntrst"`
+	// ...as hexadecimal
+	mask := (1 << 4 * ((irlen + 4) / 4)) - 1
+	ret += fmt.Sprintf("(0x%08x)", opcode&mask)
+
+	// Display DR length as a decimal value
+	ret += fmt.Sprintf(" -> DR: %d", drlen)
+
+	return ret
 }
 
 func main() {
@@ -570,21 +895,22 @@ func main() {
 	}
 	defer rpio.Close()
 
-	flag.IntVar(&DELAY_TAP, "delay-tap", 50,
-		"delay in some initializations in microseconds, keep default")
-	flag.IntVar(&DELAY_TOGGLE, "delay-toggle", 10,
-		"delay between GPIO toglles (a kind of freq), adjust to your hardware")
-	flag.BoolVar(&PULLUP, "pullup", true,
+	jtag := NewJtag()
+
+	flag.UintVar(&(jtag.DELAY_TCK), "delay-tck", 10,
+		"delay after TCK toggle in microseconds (a kind of frequency)")
+	flag.UintVar(&(jtag.DELAY_RESET), "delay-reset", 10*1000,
+		"delay of reset pulse on TRST pin in microseconds")
+	flag.BoolVar(&(jtag.PULLUP), "pullup", false,
 		"make pins pulled-up, compare results for both cases")
-	flag.BoolVar(&VERBOSE, "verbose", false, "be verbose")
 
 	pinsStrPtr := flag.String("pins", "",
 		"describe pins in JSON, example: '{ \"pin1\": 18, \"pin2\": 23, \"pin3\": 24, \"pin4\": 25, \"pin5\": 8, \"pin6\": 7, \"pin7\": 10, \"pin8\": 9, \"pin9\": 11 }'")
 
 	knownPinsStrPtr := flag.String("known-pins", "",
-		"provide known pins assignment in JSON, example: '{ \"tdi\": 18, \"tdo\": 23, \"tms\": 24, \"tck\": 25, \"ntrst\": 8 }'")
+		"provide known pins assignment in JSON, example: '{ \"tdi\": 18, \"tdo\": 23, \"tms\": 24, \"tck\": 25, \"trst\": 8 }'")
 
-	cmdPtr := flag.String("command", "", "action to perform: <loopback_check|scan|scan_idcode|sample>")
+	cmdPtr := flag.String("command", "", "action to perform: <check_loopback|scan_bypass|test_bypass|scan_idcode|test_idcode|boundary_scan|discover_opcode>")
 
 	flag.Parse()
 
@@ -593,15 +919,14 @@ func main() {
 		return
 	}
 
-	var pins []rpio.Pin
-	pinnames := make(map[rpio.Pin]string, 0)
-	var knownPins JtagPins
+	jtag.PinNames = make(map[rpio.Pin]string, 0)
+	jtag.KnownPins = JtagPins{}
 
 	switch *cmdPtr {
 	default:
 		fmt.Println("invalid command")
 		return
-	case "loopback_check", "scan", "scan_idcode":
+	case "check_loopback", "scan_bypass", "scan_idcode":
 		if len(*pinsStrPtr) == 0 {
 			fmt.Println("provide pins description")
 			return
@@ -614,21 +939,21 @@ func main() {
 
 		for key, value := range pinsJson {
 			// the following will fail with panic if input is garbage
-			pinnames[rpio.Pin(int(value.(float64)))] = key
+			jtag.PinNames[rpio.Pin(int(value.(float64)))] = key
 		}
 
-		for k := range pinnames {
-			pins = append(pins, k)
+		for k := range jtag.PinNames {
+			jtag.AllPins = append(jtag.AllPins, k)
 		}
 
-		fmt.Printf("defined pins: %v\n", pinnames)
-	case "sample":
+		fmt.Printf("defined pins: %v\n", jtag.PinNames)
+	case "test_bypass", "boundary_scan", "test_idcode", "discover_opcode":
 		if len(*knownPinsStrPtr) == 0 {
-			fmt.Println("provide known pins description for 'sample' command")
+			fmt.Printf("provide known pins description for %s command\n", *cmdPtr)
 			return
 		}
 
-		if err := json.Unmarshal([]byte(*knownPinsStrPtr), &knownPins); err != nil {
+		if err := json.Unmarshal([]byte(*knownPinsStrPtr), &jtag.KnownPins); err != nil {
 			panic(err)
 		}
 	}
@@ -637,14 +962,19 @@ func main() {
 	default:
 		fmt.Println("invalid command")
 		return
-	case "loopback_check":
-		loopback_check(pins, pinnames, PATTERN)
-	case "scan":
-		scan(pins, pinnames, PATTERN)
+	case "check_loopback":
+		jtag.checkLoopback(PATTERN)
+	case "scan_bypass":
+		jtag.scanBypass(PATTERN)
+	case "test_bypass":
+		jtag.testBypass(PATTERN)
 	case "scan_idcode":
-		scan_idcode(pins, pinnames)
-	case "sample":
-		sample([]rpio.Pin{}, SCAN_LEN+100,
-			knownPins.Tck, knownPins.Tms, knownPins.Tdi, knownPins.Tdo, knownPins.Ntrst);
+		jtag.scanIdcode()
+	case "test_idcode":
+		jtag.testIdcode()
+	case "boundary_scan":
+		jtag.boundaryScan()
+	case "discover_opcode":
+		jtag.discoverOpcode()
 	}
 }
