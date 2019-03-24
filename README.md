@@ -5,18 +5,26 @@ pins. It does so by enumerating throughout the provided pins set and trying to
 abuse some JTAG features, such as BYPASS and IDCODE registers.
 
 It is written in Go and supposed to be used under Linux (or any OS which Go
-supports) on the device with GPIO subsystem supported by `go-rpio`
-(https://github.com/stianeikeland/go-rpio) project. Raspberry Pi 1,2,3 is the
+supports) on the device with GPIO lines exported to userspace. Raspberry Pi 1,2,3 is the
 most famous example.
 
-Initially this project was a port of JTAGenum
-(https://github.com/cyphunk/JTAGenum/) to Golang. Current version has
-implementation mostly ported from another great project JTAGulator
-(https://github.com/grandideastudio/jtagulator).
+The tool drives GPIO either using
+[go-rpio](https://github.com/stianeikeland/go-rpio) or
+[libgpiod](https://git.kernel.org/pub/scm/libs/libgpiod/libgpiod.git). The first
+one is designed for Raspberry Pi and uses gpiomem driver which makes it really
+fast. `libgpiod` works on any Linux system. Thus, this tool can be used on
+general-purpose laptops/desktops as well. However, the corresponding device is
+required that exposes `/dev/gpiochipX` pseudo-files.
 
-For technical documentation refer to the original project:
-https://github.com/cyphunk/JTAGenum/blob/master/README.md and comments in the
-source code taken from JTAGulator implementation.
+Initially this project was a port of
+[JTAGenum](https://github.com/cyphunk/JTAGenum/) to Golang. Current version has
+implementation mostly ported from another great project
+[JTAGulator](https://github.com/grandideastudio/jtagulator).
+
+For technical documentation refer to the [original
+project](https://github.com/cyphunk/JTAGenum/blob/master/README.md). Also,
+consider comments in the source code that were taken from JTAGulator
+implementation.
 
 # Changes Comparing to JTAGenum
 
@@ -33,6 +41,22 @@ produces unstable results. Thus, implementation of the core functions was taken
 from JTAGulator. Once features were tested the source code was adopted to Go
 coding style.
 
+# Installation
+
+Install [libgpiod](https://git.kernel.org/pub/scm/libs/libgpiod/libgpiod.git)
+development package, usually called as `libgpiod-dev` or `libgpiod-devel`. This
+is required even on Raspberry Pi where you will not use "gpiod" driver. However,
+this is very lightweight library which could be useful by itself (well, tools
+from this library).
+
+Package installation is standard for Go packages:
+
+```
+$ go get github.com/gremwell/go-jtagenum
+```
+
+The result can be used as `$GOPATH/bin/go-jtagenum`.
+
 # Usage
 
 ## Hardware Part
@@ -48,8 +72,8 @@ identifier.
 
 ## Software Part
 
-Again, for technical documentation refer to the original project:
-https://github.com/cyphunk/JTAGenum/blob/master/README.md
+Again, for technical documentation refer to the [original
+project](https://github.com/cyphunk/JTAGenum/blob/master/README.md).
 
 Prepare pins configuration in JSON format, the following example is
 self-descriptive:
@@ -113,6 +137,41 @@ devices:
 ================================
 ```
 
+## Performance
+
+Below are the real-world examples of running this tool under Raspberry Pi 3 to
+enumerate JTAG over five pins using both drivers:
+
+```
+# time ./go-jtagenum -pins '{ "pin1": 5, "pin2": 6, "pin3": 13, "pin4": 19, "pin5": 26 }' -command scan_bypass -driver rpio
+defined pins: map[13:pin3 19:pin4 26:pin5 5:pin1 6:pin2]
+================================
+Starting scan for pattern 0110011101001101101000010111001001
+FOUND!  TCK:pin4 TMS:pin3 TDO:pin2 TDI:pin1, possible nTRST: pin5
+================================
+
+real    0m25.291s
+user    0m7.946s
+sys     0m11.806s
+```
+
+```
+# time ./go-jtagenum -pins '{ "pin1": 5, "pin2": 6, "pin3": 13, "pin4": 19, "pin5": 26 }' -command scan_bypass -driver gpiod
+defined pins: map[26:pin5 5:pin1 6:pin2 13:pin3 19:pin4]
+================================
+Starting scan for pattern 0110011101001101101000010111001001
+FOUND!  TCK:pin4 TMS:pin3 TDO:pin2 TDI:pin1, possible nTRST: pin5
+================================
+
+real    0m26.892s
+user    0m9.544s
+sys     0m13.344s
+```
+
+As can be seen, the tool itself is quite fast. `go-rpio` driver is faster than
+`libgpiod` as expected. Difference should become more noticeable when more pins
+used.
+
 ## If Something is Not Clear
 
 If tool's output is not clear or not expected, try the following:
@@ -126,4 +185,3 @@ If tool's output is not clear or not expected, try the following:
 There is a room for improvements and several ideas already came to our minds:
 - Special mode to adapt GPIO toggle delay;
 - Support partially known JTAG pins configuration;
-- Support `ftdi` additionally to `go-rpio` as a way to toggle pins.

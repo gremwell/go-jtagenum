@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/stianeikeland/go-rpio"
 	"time"
 )
 
@@ -74,70 +73,47 @@ type Jtag struct {
 	DELAY_TCK   uint
 	DELAY_RESET uint
 	PULLUP      bool
+
+	drv JtagPinDriver
 }
 
-// constructor to create Jtag instance with proper defaults
-func NewJtag() Jtag {
-	jtag := Jtag{}
-	jtag.IGNOREPIN = JtagPin(rpio.Pin(0xFF))
-	jtag.DELAY_TCK = 10
-	jtag.DELAY_RESET = 10 * 1000
-	jtag.PULLUP = false
-
-	if err := rpio.Open(); err != nil {
-		panic(err)
-	}
-
-	return jtag
-}
-
-func (J *Jtag) closeJtag() {
-	rpio.Close()
+type JtagPinDriver interface {
+	initDriver()
+	closeDriver()
+	pinWrite(JtagPin, JtagPinState)
+	pinRead(JtagPin) JtagPinState
+	pinOutput(JtagPin)
+	pinInput(JtagPin)
+	pinPullUp(JtagPin)
+	pinPullOff(JtagPin)
 }
 
 func delay(us uint) {
 	time.Sleep(time.Duration(us) * time.Microsecond)
 }
 
-func (J *Jtag) pinWrite(pin JtagPin, state JtagPinState) {
-	if state == StateHigh {
-		rpio.WritePin(rpio.Pin(pin), rpio.High)
-	} else {
-		rpio.WritePin(rpio.Pin(pin), rpio.Low)
-	}
+// constructor to create Jtag instance with proper defaults
+func NewJtag() Jtag {
+	jtag := Jtag{}
+	jtag.IGNOREPIN = JtagPin(0xFF)
+	jtag.DELAY_TCK = 10
+	jtag.DELAY_RESET = 10 * 1000
+	jtag.PULLUP = false
+	return jtag
+}
+
+func (J *Jtag) setJtagDriver(driver JtagPinDriver) {
+	J.drv = driver
+	J.drv.initDriver()
+}
+
+func (J *Jtag) closeJtag() {
+	J.drv.closeDriver()
 }
 
 func (J *Jtag) pinWriteDelay(pin JtagPin, state JtagPinState) {
-	if state == StateHigh {
-		rpio.WritePin(rpio.Pin(pin), rpio.High)
-	} else {
-		rpio.WritePin(rpio.Pin(pin), rpio.Low)
-	}
+	J.drv.pinWrite(pin, state)
 	delay(J.DELAY_TCK)
-}
-
-func (J *Jtag) pinRead(pin JtagPin) JtagPinState {
-	if rpio.ReadPin(rpio.Pin(pin)) == rpio.High {
-		return StateHigh
-	} else {
-		return StateLow
-	}
-}
-
-func (J *Jtag) pinOutput(pin JtagPin) {
-	rpio.PinMode(rpio.Pin(pin), rpio.Output)
-}
-
-func (J *Jtag) pinInput(pin JtagPin) {
-	rpio.PinMode(rpio.Pin(pin), rpio.Input)
-}
-
-func (J *Jtag) pinPullUp(pin JtagPin) {
-	rpio.PullMode(rpio.Pin(pin), rpio.PullUp)
-}
-
-func (J *Jtag) pinPullOff(pin JtagPin) {
-	rpio.PullMode(rpio.Pin(pin), rpio.PullOff)
 }
 
 func (J *Jtag) pulseTCK(cnt int) {
@@ -148,16 +124,16 @@ func (J *Jtag) pulseTCK(cnt int) {
 }
 
 func (J *Jtag) pulseTMS(sTMS JtagPinState) {
-	J.pinWrite(J.TMS, sTMS)
+	J.drv.pinWrite(J.TMS, sTMS)
 	J.pulseTCK(1)
 }
 
 func (J *Jtag) setTapState(tapState string) {
 	for _, ts := range tapState {
 		if ts == '1' {
-			J.pinWrite(J.TMS, StateHigh)
+			J.drv.pinWrite(J.TMS, StateHigh)
 		} else {
-			J.pinWrite(J.TMS, StateLow)
+			J.drv.pinWrite(J.TMS, StateLow)
 		}
 		J.pulseTCK(1)
 	}
@@ -178,22 +154,22 @@ func (J *Jtag) initPins() {
 		if pin == J.IGNOREPIN {
 			continue
 		}
-		J.pinOutput(pin)
-		J.pinWrite(pin, StateHigh)
+		J.drv.pinOutput(pin)
+		J.drv.pinWrite(pin, StateHigh)
 		if J.PULLUP == true {
-			J.pinPullUp(pin)
+			J.drv.pinPullUp(pin)
 		} else {
-			J.pinPullOff(pin)
+			J.drv.pinPullOff(pin)
 		}
 	}
 
 	if J.TDO != J.IGNOREPIN {
-		J.pinInput(J.TDO)
+		J.drv.pinInput(J.TDO)
 	}
 
 	// set known clock state
 	if J.TCK != J.IGNOREPIN {
-		J.pinWrite(J.TCK, StateLow)
+		J.drv.pinWrite(J.TCK, StateLow)
 	}
 }
 
@@ -225,18 +201,18 @@ func (J *Jtag) sendData(pattern []byte) []byte {
 	ret := []byte{}
 	for i, s := range pattern {
 		if s == '1' {
-			J.pinWrite(J.TDI, StateHigh)
+			J.drv.pinWrite(J.TDI, StateHigh)
 		} else {
-			J.pinWrite(J.TDI, StateLow)
+			J.drv.pinWrite(J.TDI, StateLow)
 		}
-		if J.pinRead(J.TDO) == StateHigh {
+		if J.drv.pinRead(J.TDO) == StateHigh {
 			ret = append(ret, '1')
 		} else {
 			ret = append(ret, '0')
 		}
 		if i == len(pattern)-1 {
 			// Go to Exit1
-			J.pinWrite(J.TMS, StateHigh)
+			J.drv.pinWrite(J.TMS, StateHigh)
 		}
 		J.pulseTCK(1)
 	}
@@ -260,18 +236,18 @@ func (J *Jtag) sendInstruction(instruction []byte) []byte {
 	ret := []byte{}
 	for i, s := range instruction {
 		if s == '1' {
-			J.pinWrite(J.TDI, StateHigh)
+			J.drv.pinWrite(J.TDI, StateHigh)
 		} else {
-			J.pinWrite(J.TDI, StateLow)
+			J.drv.pinWrite(J.TDI, StateLow)
 		}
-		if J.pinRead(J.TDO) == StateHigh {
+		if J.drv.pinRead(J.TDO) == StateHigh {
 			ret = append(ret, '1')
 		} else {
 			ret = append(ret, '0')
 		}
 		if i == len(instruction)-1 {
 			// Go to Exit1
-			J.pinWrite(J.TMS, StateHigh)
+			J.drv.pinWrite(J.TMS, StateHigh)
 		}
 		J.pulseTCK(1)
 	}
@@ -294,7 +270,7 @@ func (J *Jtag) sendRecvBypassPattern(devCnt int, pattern []byte) []byte {
 	J.setTapState(TAP_SHIFTIR)
 
 	// Force all devices in the chain (if they exist) into BYPASS mode using opcode of all 1s
-	J.pinWrite(J.TDI, StateHigh)
+	J.drv.pinWrite(J.TDI, StateHigh)
 	J.pulseTCK(devCnt * MAX_IR_LEN)
 
 	// Go to Exit1 IR
@@ -324,7 +300,7 @@ func (J *Jtag) detectDevices() int {
 	J.setTapState(TAP_SHIFTIR)
 
 	// Force all devices in the chain (if they exist) into BYPASS mode using opcode of all 1s
-	J.pinWrite(J.TDI, StateHigh)
+	J.drv.pinWrite(J.TDI, StateHigh)
 	J.pulseTCK(MAX_IR_CHAIN_LEN - 1)
 
 	// Go to Exit1 IR
@@ -347,10 +323,10 @@ func (J *Jtag) detectDevices() int {
 
 	// We are now in BYPASS mode with all DR set
 	// Send in a 0 on TDI and count until we see it on TDO
-	J.pinWrite(J.TDI, StateLow)
+	J.drv.pinWrite(J.TDI, StateLow)
 	devCnt := 0
 	for devCnt = 0; devCnt < MAX_DEV_NR; devCnt += 1 {
-		if J.pinRead(J.TDO) == StateLow {
+		if J.drv.pinRead(J.TDO) == StateLow {
 			// If we have received our 0, it has propagated through the entire chain (one clock cycle per device in the chain)
 			break
 		}
@@ -385,17 +361,17 @@ func (J *Jtag) detectIrLength() uint32 {
 	J.setTapState(TAP_SHIFTIR)
 
 	// Flush the IR
-	J.pinWrite(J.TCK, StateLow)
+	J.drv.pinWrite(J.TCK, StateLow)
 	// Since the length is unknown, send lots of 0s
 	J.pulseTCK(MAX_IR_LEN - 1)
 
 	// Once we are sure that the IR is filled with 0s
 	// Send in a 1 on TDI and count until we see it on TDO
-	J.pinWrite(J.TDI, StateHigh)
+	J.drv.pinWrite(J.TDI, StateHigh)
 	num := uint32(0)
 	for num = 0; num < MAX_IR_LEN; num += 1 {
 		// If we have received our 1, it has propagated through the entire instruction register
-		if J.pinRead(J.TDO) == StateHigh {
+		if J.drv.pinRead(J.TDO) == StateHigh {
 			break
 		}
 		J.pulseTCK(1)
@@ -443,16 +419,16 @@ func (J *Jtag) detectDrLength(opcode uint32) uint32 {
 
 	// At this point, a specific DR will be selected, so we can now determine its length.
 	// Flush the DR
-	J.pinWrite(J.TDI, StateLow)
+	J.drv.pinWrite(J.TDI, StateLow)
 	J.pulseTCK(MAX_DR_LEN - 1)
 
 	// Once we are sure that the DR is filled with 0s
 	// Send in a 1 on TDI and count until we see it on TDO
-	J.pinWrite(J.TDI, StateHigh)
+	J.drv.pinWrite(J.TDI, StateHigh)
 	num := uint32(0)
 	for num = 0; num < MAX_DR_LEN; num += 1 {
 		// If we have received our 1, it has propagated through the entire data register
-		if J.pinRead(J.TDO) == StateHigh {
+		if J.drv.pinRead(J.TDO) == StateHigh {
 			break
 		}
 		J.pulseTCK(1)
@@ -526,7 +502,7 @@ func (J *Jtag) scanBypass(pattern string) {
 							J.TRST = trst
 
 							// do reset
-							J.pinWrite(J.TRST, StateLow)
+							J.drv.pinWrite(J.TRST, StateLow)
 							// Give target time to react
 							delay(J.DELAY_RESET)
 
@@ -537,7 +513,7 @@ func (J *Jtag) scanBypass(pattern string) {
 							}
 
 							// Bring the current pin HIGH when done
-							J.pinWrite(J.TRST, StateHigh)
+							J.drv.pinWrite(J.TRST, StateHigh)
 						}
 						fmt.Println("")
 					} else {
@@ -604,12 +580,12 @@ func (J *Jtag) getIdcodes(devCnt int) []uint32 {
 		// Receive 32-bit value from DR (should be IDCODE if exists), leaves the TAP in Exit1 DR
 		idcode := uint32(0)
 		for k := 0; k < 32; k += 1 {
-			if J.pinRead(J.TDO) == StateHigh {
+			if J.drv.pinRead(J.TDO) == StateHigh {
 				idcode |= (1 << uint(k))
 			}
 			if k == 31 {
 				// Go to Exit1
-				J.pinWrite(J.TMS, StateHigh)
+				J.drv.pinWrite(J.TMS, StateHigh)
 			}
 			J.pulseTCK(1)
 		}
@@ -685,7 +661,7 @@ func (J *Jtag) scanIdcode() {
 						J.TRST = trst
 
 						// do reset
-						J.pinWrite(J.TRST, StateLow)
+						J.drv.pinWrite(J.TRST, StateLow)
 						// Give target time to react
 						delay(J.DELAY_RESET)
 
@@ -697,7 +673,7 @@ func (J *Jtag) scanIdcode() {
 						}
 
 						// Bring the current pin HIGH when done
-						J.pinWrite(J.TRST, StateHigh)
+						J.drv.pinWrite(J.TRST, StateHigh)
 					}
 					fmt.Println("")
 				}
@@ -735,11 +711,11 @@ func (J *Jtag) checkLoopback(pattern string) {
 			recv := []byte{}
 			for _, s := range pattern {
 				if s == '1' {
-					J.pinWrite(J.TDI, StateHigh)
+					J.drv.pinWrite(J.TDI, StateHigh)
 				} else {
-					J.pinWrite(J.TDI, StateLow)
+					J.drv.pinWrite(J.TDI, StateLow)
 				}
-				if J.pinRead(J.TDO) == StateHigh {
+				if J.drv.pinRead(J.TDO) == StateHigh {
 					recv = append(recv, '1')
 				} else {
 					recv = append(recv, '0')
@@ -879,7 +855,7 @@ func (J *Jtag) boundaryScan() {
 	for i := 0; i < 2000; i += 1 {
 		// no need to set TMS. It's set to the '0' state to
 		// force a Shift DR by the TAP
-		if J.pinRead(J.TDO) == StateHigh {
+		if J.drv.pinRead(J.TDO) == StateHigh {
 			fmt.Print('1')
 		} else {
 			fmt.Print('0')
@@ -953,6 +929,11 @@ func main() {
 
 	cmdPtr := flag.String("command", "", "action to perform: <check_loopback|scan_bypass|test_bypass|scan_idcode|test_idcode|boundary_scan|discover_opcode>")
 
+	drvPtr := flag.String("driver", "rpio", "drive GPIO via: <rpio|gpiod>")
+	gpiodChip := uint(0)
+	flag.UintVar(&(gpiodChip), "gpiochip", 0,
+		"GPIO chip number to take pins from one of /dev/gpiochipX, used by 'gpiod' driver")
+
 	flag.Parse()
 
 	if len(*cmdPtr) == 0 {
@@ -997,6 +978,18 @@ func main() {
 		if err := json.Unmarshal([]byte(*knownPinsStrPtr), &jtag.KnownPins); err != nil {
 			panic(err)
 		}
+	}
+
+	switch *drvPtr {
+	default:
+		drv := &JtagPinDriverRpio{}
+		jtag.setJtagDriver(drv)
+	case "rpio":
+		drv := &JtagPinDriverRpio{}
+		jtag.setJtagDriver(drv)
+	case "gpiod":
+		drv := &JtagPinDriverGpiod{}
+		jtag.setJtagDriver(drv)
 	}
 
 	switch *cmdPtr {
