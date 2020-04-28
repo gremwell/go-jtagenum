@@ -108,7 +108,9 @@ func (J *Jtag) setJtagDriver(driver JtagPinDriver) {
 }
 
 func (J *Jtag) closeJtag() {
-	J.drv.closeDriver()
+	if J.drv != nil {
+		J.drv.closeDriver()
+	}
 }
 
 func (J *Jtag) pinWriteDelay(pin JtagPin, state JtagPinState) {
