@@ -34,7 +34,7 @@ reasons:
 - shell version is *very* slow due to `echo 1 > /sys/...gpio` interface;
 - Arduino version requires... Arduino controller;
 - Arduino version requires source code modification;
-- to practice Golan a bit :-)
+- to practice Golang a bit :-)
 
 After porting was finished it became clear that logic behind is not perfect and
 produces unstable results. Thus, implementation of the core functions was taken
